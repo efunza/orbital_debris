@@ -1,13 +1,15 @@
 # orbital_debris_app.py
-# UPGRADED: Orbital Debris Tracking + Orbit Class Filter + 3D Plotly + Coarse→Refined Conjunction Detection
-# Streamlit Cloud ready (works even if web TLE download times out via upload + built-in sample fallback)
+# UPGRADED + FIXED: Orbital Debris Tracking + Orbit Class Filter + 3D Plotly + Coarse→Refined Conjunction Detection
+# FIXES INCLUDED:
+# - Keep time alignment across satellites (no dropping invalid SGP4 points)
+# - Skip NaN/invalid points in binning and distance checks (prevents bin_key crash)
+# - Refine step uses the same time grid logic safely
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from itertools import combinations
 from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -191,18 +193,17 @@ def propagate_times(start: datetime, steps: int, step_minutes: int) -> List[date
 
 
 def sgp4_positions(sat: Satrec, times: List[datetime]) -> np.ndarray:
-    """Return ECI position vectors (km), dropping invalid points."""
+    """
+    Return ECI position vectors (km) with time alignment preserved.
+    Invalid points are filled with NaNs (instead of being dropped).
+    Shape is always (len(times), 3).
+    """
     out = np.empty((len(times), 3), dtype=np.float64)
-    valid = np.ones(len(times), dtype=bool)
     for i, t in enumerate(times):
         jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
         e, r, _v = sat.sgp4(jd, fr)
-        if e != 0:
-            valid[i] = False
-            out[i] = np.nan
-        else:
-            out[i] = r
-    return out[valid]
+        out[i] = r if e == 0 else (np.nan, np.nan, np.nan)
+    return out
 
 
 def classify_orbit_by_alt_km(alt_km: float) -> str:
@@ -235,12 +236,14 @@ with st.spinner("Propagating coarse trajectories (SGP4)..."):
         try:
             sat = Satrec.twoline2rv(item.line1, item.line2)
             pos = sgp4_positions(sat, coarse_times)
-            if len(pos) < 2:
+
+            # Find first valid point for classification
+            finite_mask = np.isfinite(pos).all(axis=1)
+            if not np.any(finite_mask):
                 bad += 1
                 continue
-
-            # Classify using first valid radius
-            r0 = float(np.linalg.norm(pos[0]))
+            first_idx = int(np.argmax(finite_mask))
+            r0 = float(np.linalg.norm(pos[first_idx]))
             alt0 = r0 - EARTH_RADIUS_KM
             cls = classify_orbit_by_alt_km(alt0)
 
@@ -268,19 +271,30 @@ if len(names) < 2:
 
 # Show class counts
 counts = pd.Series([sat_class[n] for n in names_all]).value_counts()
-with st.expander("Orbit class counts (based on first-step altitude)"):
+with st.expander("Orbit class counts (based on first valid-step altitude)"):
     st.dataframe(counts.rename("count").to_frame(), use_container_width=True)
 
 # -----------------------------
 # COARSE CONJUNCTION DETECTION WITH GRID BINNING
 # -----------------------------
-def bin_key(vec: np.ndarray, bin_km: int) -> Tuple[int, int, int]:
-    return (int(math.floor(vec[0] / bin_km)), int(math.floor(vec[1] / bin_km)), int(math.floor(vec[2] / bin_km)))
+def bin_key(vec: np.ndarray, bin_km: int) -> Optional[Tuple[int, int, int]]:
+    """
+    Map a 3D ECI point to a grid bin. Returns None if vec is invalid (NaN/inf/wrong shape).
+    """
+    if vec is None:
+        return None
+    vec = np.asarray(vec)
+    if vec.shape != (3,):
+        return None
+    if not np.isfinite(vec).all():
+        return None
+    x, y, z = float(vec[0]), float(vec[1]), float(vec[2])
+    return (int(math.floor(x / bin_km)), int(math.floor(y / bin_km)), int(math.floor(z / bin_km)))
 
 
 def neighbor_bins(k: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
     x, y, z = k
-    out = []
+    out: List[Tuple[int, int, int]] = []
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             for dz in (-1, 0, 1):
@@ -295,9 +309,8 @@ st.caption(
     "Step 2 (refined): for candidate pairs, re-simulate with finer time steps around closest coarse moment."
 )
 
-# Build a 3D array [time, obj, 3] for fast indexing (ragged lengths possible, so we clip)
-# We'll use the minimum length across objects so time alignment works.
-min_T = min(len(sat_pos_coarse[n]) for n in names)
+# Build a 3D array [time, obj, 3] with aligned time axis
+min_T = len(coarse_times)
 names = names[:]  # copy
 pos_cube = np.stack([sat_pos_coarse[n][:min_T] for n in names], axis=1)  # (T, N, 3)
 
@@ -307,36 +320,42 @@ with st.spinner("Running coarse scan (grid-binning)..."):
     for t_idx in range(min_T):
         pts = pos_cube[t_idx]  # (N,3)
 
-        # Bin objects
+        # Bin objects (skip invalid points)
         bins: Dict[Tuple[int, int, int], List[int]] = {}
         for i in range(len(names)):
             k = bin_key(pts[i], bin_size_km)
+            if k is None:
+                continue
             bins.setdefault(k, []).append(i)
 
-        # Compare only within bins and neighboring bins
         compared = 0
-        for bk, idxs in bins.items():
-            # combine objects in this bin + neighbors
+        for bk, _idxs in bins.items():
             neighbor_idxs: List[int] = []
             for nb in neighbor_bins(bk):
                 if nb in bins:
                     neighbor_idxs.extend(bins[nb])
 
-            # Remove duplicates by sorting unique
             if len(neighbor_idxs) < 2:
                 continue
             neighbor_idxs = sorted(set(neighbor_idxs))
 
-            # Compare pairs inside this neighborhood
             for a_pos in range(len(neighbor_idxs)):
                 ia = neighbor_idxs[a_pos]
+                pa = pts[ia]
+                if not np.isfinite(pa).all():
+                    continue
+
                 for b_pos in range(a_pos + 1, len(neighbor_idxs)):
                     ib = neighbor_idxs[b_pos]
+                    pb = pts[ib]
+                    if not np.isfinite(pb).all():
+                        continue
+
                     compared += 1
                     if compared > max_pairs_per_step:
                         break
 
-                    d = float(np.linalg.norm(pts[ia] - pts[ib]))
+                    d = float(np.linalg.norm(pa - pb))
                     if d <= coarse_candidate_km:
                         key = (ia, ib)
                         prev = candidate_pairs.get(key)
@@ -358,27 +377,22 @@ st.write(f"Candidate pairs refined (cap {max_total_candidates}): **{len(cand_ite
 # REFINED CHECK FOR CANDIDATES
 # -----------------------------
 def refine_pair(
-    name_a: str,
-    name_b: str,
     tle_a: TLEItem,
     tle_b: TLEItem,
-    coarse_best_t: int,
-    coarse_dt_minutes: int,
+    center_time: datetime,
     refine_step_min: int,
     window_hours: int,
 ) -> float:
     """
-    Re-simulate A and B with finer steps around the best coarse time index.
+    Re-simulate A and B with finer steps around center_time.
     Return min distance (km) in that refined window.
     """
     satA = Satrec.twoline2rv(tle_a.line1, tle_a.line2)
     satB = Satrec.twoline2rv(tle_b.line1, tle_b.line2)
 
-    center_time = t0 + timedelta(minutes=coarse_best_t * coarse_dt_minutes)
     start = center_time - timedelta(hours=window_hours)
     end = center_time + timedelta(hours=window_hours)
 
-    # build refined times
     total_minutes = int((end - start).total_seconds() / 60)
     steps = max(2, total_minutes // refine_step_min)
     times = [start + timedelta(minutes=k * refine_step_min) for k in range(steps + 1)]
@@ -386,10 +400,11 @@ def refine_pair(
     pa = sgp4_positions(satA, times)
     pb = sgp4_positions(satB, times)
 
-    n = min(len(pa), len(pb))
-    if n == 0:
+    valid = np.isfinite(pa).all(axis=1) & np.isfinite(pb).all(axis=1)
+    if not np.any(valid):
         return float("inf")
-    d = np.linalg.norm(pa[:n] - pb[:n], axis=1)
+
+    d = np.linalg.norm(pa[valid] - pb[valid], axis=1)
     return float(np.min(d))
 
 
@@ -403,15 +418,15 @@ with st.spinner("Refining candidate pairs (finer time steps)..."):
         A = names[i]
         B = names[j]
 
-        # Need original TLE lines
         if A not in tle_by_name or B not in tle_by_name:
             continue
 
+        center_time = t0 + timedelta(minutes=t_best * coarse_step_minutes)
+
         d_ref = refine_pair(
-            A, B,
-            tle_by_name[A], tle_by_name[B],
-            coarse_best_t=t_best,
-            coarse_dt_minutes=coarse_step_minutes,
+            tle_by_name[A],
+            tle_by_name[B],
+            center_time=center_time,
             refine_step_min=refine_minutes,
             window_hours=refine_window_hours,
         )
@@ -445,22 +460,24 @@ else:
 # -----------------------------
 st.subheader("🧊 3D Interactive Orbit Viewer (Plotly)")
 
-# Choose objects to plot:
 plot_names = names[:min(plot_tracks, len(names))]
 
-# Downsample points for plotting
 T_plot = min(min_T, plot_points_cap)
 idxs = np.linspace(0, min_T - 1, T_plot).astype(int)
 
 fig = go.Figure()
 
-# Optional highlight: pick first risky pair if exists
 highlight_pair: Set[str] = set()
 if refined_events:
     highlight_pair = {refined_events[0][0], refined_events[0][1]}
 
 for nm in plot_names:
     track = sat_pos_coarse[nm][:min_T][idxs]
+    valid = np.isfinite(track).all(axis=1)
+    track = track[valid]
+    if len(track) < 2:
+        continue
+
     is_highlight = nm in highlight_pair
     fig.add_trace(
         go.Scatter3d(
@@ -468,14 +485,14 @@ for nm in plot_names:
             y=track[:, 1],
             z=track[:, 2],
             mode="lines",
-            name=nm if is_highlight else None,  # reduce legend clutter
+            name=nm if is_highlight else None,
             showlegend=is_highlight,
             line=dict(width=5 if is_highlight else 2),
             opacity=1.0 if is_highlight else 0.5,
         )
     )
 
-# Add Earth sphere (simple)
+# Add Earth sphere
 u = np.linspace(0, 2 * np.pi, 50)
 v = np.linspace(0, np.pi, 25)
 xs = EARTH_RADIUS_KM * np.outer(np.cos(u), np.sin(v))
