@@ -1,9 +1,12 @@
 # orbital_debris_app.py
-# UPGRADED + FIXED: Orbital Debris Tracking + Orbit Class Filter + 3D Plotly + Coarse→Refined Conjunction Detection
-# FIXES INCLUDED:
-# - Keep time alignment across satellites (no dropping invalid SGP4 points)
-# - Skip NaN/invalid points in binning and distance checks (prevents bin_key crash)
-# - Refine step uses the same time grid logic safely
+# COMPLETE FIXED VERSION
+# Fixes:
+# 1) Keeps time alignment across satellites (no dropping invalid SGP4 points)
+# 2) Skips invalid/NaN points during binning + distance checks (prevents bin_key crash)
+# 3) Makes the “Not enough objects…” message truthful:
+#    - If orbit_class == "All" and still <2 objects => propagation/TLE problem, not filtering
+# 4) Adds a Debug expander to show: parsed TLE preview + why objects were skipped
+# 5) More robust TLE parsing (ignores non-TLE junk lines)
 
 from __future__ import annotations
 
@@ -14,11 +17,10 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from sgp4.api import Satrec, jday
-
-import plotly.graph_objects as go
 
 # -----------------------------
 # CONFIG
@@ -27,7 +29,6 @@ EARTH_RADIUS_KM = 6371.0
 
 CELESTRAK_ACTIVE = "https://celestrak.org/NORAD/elements/gp.php?GROUP=active&FORMAT=tle"
 GITHUB_ACTIVE_1 = "https://raw.githubusercontent.com/CelesTrak/fundamentals/master/active.txt"
-
 TLE_URLS = [CELESTRAK_ACTIVE, GITHUB_ACTIVE_1]
 
 SAMPLE_TLE_TEXT = """ISS (ZARYA)
@@ -61,19 +62,15 @@ uploaded_tle = st.sidebar.file_uploader("Upload a TLE file (recommended)", type=
 
 st.sidebar.divider()
 st.sidebar.header("⚙️ Simulation Settings")
-
 num_objects = st.sidebar.slider("Max objects to load", 20, 600, 250, step=10)
 days_to_simulate = st.sidebar.slider("Simulation window (days)", 1, 30, 7)
 
-# Coarse sampling
 coarse_steps_per_day = st.sidebar.slider("Coarse steps/day", 1, 24, 4)
-# Refinement
 refine_minutes = st.sidebar.slider("Refined step (minutes)", 1, 60, 10)
 refine_window_hours = st.sidebar.slider("Refine window (± hours around closest coarse step)", 1, 72, 24)
 
 st.sidebar.divider()
 st.sidebar.header("🔎 Detection Thresholds")
-
 final_threshold_km = st.sidebar.slider("High-risk threshold (km)", 0.1, 10.0, 1.0)
 coarse_candidate_km = st.sidebar.slider(
     "Coarse candidate threshold (km)",
@@ -87,14 +84,12 @@ st.sidebar.divider()
 st.sidebar.header("🧭 Orbit Class Filter")
 orbit_class = st.sidebar.selectbox("Analyze orbit class", ["All", "LEO", "MEO", "GEO"])
 
-# Spatial indexing (grid binning)
 st.sidebar.divider()
 st.sidebar.header("⚡ Speed Controls")
 bin_size_km = st.sidebar.slider("3D bin size for coarse scan (km)", 50, 1000, 250, step=50)
 max_pairs_per_step = st.sidebar.slider("Max pairs compared per time step", 500, 20000, 6000, step=500)
 max_total_candidates = st.sidebar.slider("Max candidate pairs to refine", 100, 20000, 4000, step=100)
 
-# 3D plot controls
 st.sidebar.divider()
 st.sidebar.header("🧊 3D Plot")
 plot_tracks = st.sidebar.slider("How many object tracks to plot (3D)", 5, 80, 25)
@@ -123,22 +118,43 @@ def http_get_text(url: str, timeout: int = 12) -> Tuple[Optional[str], Optional[
         return None, str(e)
 
 
+def _looks_like_tle_line1(s: str) -> bool:
+    s = s.rstrip()
+    return len(s) >= 2 and s.startswith("1 ") and s[1:2] == " "
+
+
+def _looks_like_tle_line2(s: str) -> bool:
+    s = s.rstrip()
+    return len(s) >= 2 and s.startswith("2 ") and s[1:2] == " "
+
+
 def parse_tle_text(text: str) -> List[TLEItem]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    """
+    Robust-ish TLE parser:
+    - Accepts both 2-line (no name) and 3-line (name + 2 lines)
+    - Ignores random junk lines (HTML, headers) unless they fit TLE format
+    """
+    raw_lines = [ln.rstrip("\n") for ln in text.splitlines()]
+    lines = [ln.strip("\r").strip() for ln in raw_lines if ln.strip()]
+
     items: List[TLEItem] = []
     i = 0
     while i < len(lines):
-        # 2-line format (no name)
-        if lines[i].startswith("1 ") and i + 1 < len(lines) and lines[i + 1].startswith("2 "):
-            items.append(TLEItem(name=f"OBJECT_{len(items)+1}", line1=lines[i], line2=lines[i + 1]))
-            i += 2
-            continue
-        # 3-line format (name + 2 lines)
-        if i + 2 < len(lines) and lines[i + 1].startswith("1 ") and lines[i + 2].startswith("2 "):
-            items.append(TLEItem(name=lines[i], line1=lines[i + 1], line2=lines[i + 2]))
+        # 3-line: name + line1 + line2
+        if i + 2 < len(lines) and _looks_like_tle_line1(lines[i + 1]) and _looks_like_tle_line2(lines[i + 2]):
+            nm = lines[i]
+            items.append(TLEItem(name=nm, line1=lines[i + 1], line2=lines[i + 2]))
             i += 3
             continue
+
+        # 2-line: line1 + line2
+        if i + 1 < len(lines) and _looks_like_tle_line1(lines[i]) and _looks_like_tle_line2(lines[i + 1]):
+            items.append(TLEItem(name=f"OBJECT_{len(items) + 1}", line1=lines[i], line2=lines[i + 1]))
+            i += 2
+            continue
+
         i += 1
+
     return items
 
 
@@ -151,9 +167,10 @@ def load_tles_from_web() -> Tuple[List[TLEItem], str, List[str]]:
             items = parse_tle_text(text)
             if items:
                 return items, f"Downloaded from {url}", notes
-            notes.append(f"Parsed 0 TLEs from {url}")
+            notes.append(f"Parsed 0 TLEs from {url} (content may be blocked/HTML)")
         else:
             notes.append(f"Download failed {url}: {err}")
+
     items = parse_tle_text(SAMPLE_TLE_TEXT)
     notes.append("Using built-in sample TLEs (web download failed). Upload a TLE file for real tracking.")
     return items, "Built-in sample", notes
@@ -175,7 +192,7 @@ else:
 
 tle_items = tle_items[:num_objects]
 
-st.success(f"TLE source: **{tle_source}** • Loaded: **{len(tle_items)} objects**")
+st.success(f"TLE source: **{tle_source}** • Parsed: **{len(tle_items)} objects**")
 if tle_notes:
     with st.expander("TLE loading notes"):
         for n in tle_notes:
@@ -184,6 +201,12 @@ if tle_notes:
 if len(tle_items) < 2:
     st.error("Need at least 2 TLE objects to run conjunction detection.")
     st.stop()
+
+with st.expander("Debug: preview parsed TLEs (first 10)"):
+    for it in tle_items[:10]:
+        st.write(f"**{it.name}**")
+        st.code(it.line1)
+        st.code(it.line2)
 
 # -----------------------------
 # ORBIT PROPAGATION
@@ -207,12 +230,10 @@ def sgp4_positions(sat: Satrec, times: List[datetime]) -> np.ndarray:
 
 
 def classify_orbit_by_alt_km(alt_km: float) -> str:
-    # Simple bins (good enough for science fair)
     if alt_km < 2000:
         return "LEO"
     if alt_km < 35786:
         return "MEO"
-    # GEO band (loose; real GEO has inclination/ecc constraints)
     if 33000 <= alt_km <= 39000:
         return "GEO"
     return "HighEarth/Other"
@@ -231,17 +252,20 @@ with st.spinner("Propagating coarse trajectories (SGP4)..."):
     sat_class: Dict[str, str] = {}
     sat_alt0: Dict[str, float] = {}
     bad = 0
+    fail_log: List[str] = []
 
     for item in tle_items:
         try:
             sat = Satrec.twoline2rv(item.line1, item.line2)
             pos = sgp4_positions(sat, coarse_times)
 
-            # Find first valid point for classification
             finite_mask = np.isfinite(pos).all(axis=1)
             if not np.any(finite_mask):
                 bad += 1
+                if len(fail_log) < 30:
+                    fail_log.append(f"{item.name}: all time steps invalid (SGP4 error at each step)")
                 continue
+
             first_idx = int(np.argmax(finite_mask))
             r0 = float(np.linalg.norm(pos[first_idx]))
             alt0 = r0 - EARTH_RADIUS_KM
@@ -250,23 +274,43 @@ with st.spinner("Propagating coarse trajectories (SGP4)..."):
             sat_pos_coarse[item.name] = pos
             sat_class[item.name] = cls
             sat_alt0[item.name] = alt0
-        except Exception:
+
+        except Exception as e:
             bad += 1
+            if len(fail_log) < 30:
+                fail_log.append(f"{item.name}: {type(e).__name__}: {e}")
 
 names_all = list(sat_pos_coarse.keys())
 
-if orbit_class != "All":
-    names = [n for n in names_all if sat_class.get(n) == orbit_class]
-else:
-    names = names_all
+st.write(f"Valid propagated: **{len(names_all)}** • Skipped: **{bad}**")
 
-st.write(
-    f"Valid propagated: **{len(names_all)}** • Skipped: **{bad}** • "
-    f"After filter ({orbit_class}): **{len(names)}**"
-)
+if fail_log:
+    with st.expander("Debug: why objects were skipped (first 30)"):
+        for msg in fail_log:
+            st.write("•", msg)
+
+# IMPORTANT: If orbit_class == "All" and we still have <2, it's NOT a filter issue.
+if len(names_all) < 2:
+    st.error(
+        "Propagation produced fewer than 2 valid objects. "
+        "This is a TLE/propagation issue (not the orbit-class filter). "
+        "Open the debug expanders above to see why objects were skipped."
+    )
+    st.stop()
+
+# Apply orbit filter only if not All
+if orbit_class == "All":
+    names = names_all
+else:
+    names = [n for n in names_all if sat_class.get(n) == orbit_class]
+
+st.write(f"After filter ({orbit_class}): **{len(names)}**")
 
 if len(names) < 2:
-    st.warning("Not enough objects after orbit-class filtering. Choose 'All' or upload a larger TLE set.")
+    st.warning(
+        "Not enough objects after orbit-class filtering. "
+        "Choose 'All' or upload a larger TLE set that includes that orbit region."
+    )
     st.stop()
 
 # Show class counts
@@ -278,9 +322,6 @@ with st.expander("Orbit class counts (based on first valid-step altitude)"):
 # COARSE CONJUNCTION DETECTION WITH GRID BINNING
 # -----------------------------
 def bin_key(vec: np.ndarray, bin_km: int) -> Optional[Tuple[int, int, int]]:
-    """
-    Map a 3D ECI point to a grid bin. Returns None if vec is invalid (NaN/inf/wrong shape).
-    """
     if vec is None:
         return None
     vec = np.asarray(vec)
@@ -303,22 +344,20 @@ def neighbor_bins(k: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
 
 
 st.subheader("🔍 Coarse→Refined Conjunction Detection")
-
 st.caption(
     "Step 1 (coarse): grid-binning reduces comparisons. "
     "Step 2 (refined): for candidate pairs, re-simulate with finer time steps around closest coarse moment."
 )
 
-# Build a 3D array [time, obj, 3] with aligned time axis
-min_T = len(coarse_times)
-names = names[:]  # copy
-pos_cube = np.stack([sat_pos_coarse[n][:min_T] for n in names], axis=1)  # (T, N, 3)
+# Build aligned cube: [time, obj, 3]
+T = len(coarse_times)
+pos_cube = np.stack([sat_pos_coarse[n][:T] for n in names], axis=1)  # (T, N, 3)
 
 candidate_pairs: Dict[Tuple[int, int], Tuple[float, int]] = {}  # (i,j)->(best_coarse_dist, best_t_index)
 
 with st.spinner("Running coarse scan (grid-binning)..."):
-    for t_idx in range(min_T):
-        pts = pos_cube[t_idx]  # (N,3)
+    for t_idx in range(T):
+        pts = pos_cube[t_idx]  # (N, 3)
 
         # Bin objects (skip invalid points)
         bins: Dict[Tuple[int, int, int], List[int]] = {}
@@ -329,7 +368,7 @@ with st.spinner("Running coarse scan (grid-binning)..."):
             bins.setdefault(k, []).append(i)
 
         compared = 0
-        for bk, _idxs in bins.items():
+        for bk in bins.keys():
             neighbor_idxs: List[int] = []
             for nb in neighbor_bins(bk):
                 if nb in bins:
@@ -337,6 +376,7 @@ with st.spinner("Running coarse scan (grid-binning)..."):
 
             if len(neighbor_idxs) < 2:
                 continue
+
             neighbor_idxs = sorted(set(neighbor_idxs))
 
             for a_pos in range(len(neighbor_idxs)):
@@ -367,7 +407,6 @@ with st.spinner("Running coarse scan (grid-binning)..."):
             if compared > max_pairs_per_step:
                 break
 
-# Limit candidate pairs to refine
 cand_items = sorted(candidate_pairs.items(), key=lambda kv: kv[1][0])[:max_total_candidates]
 
 st.write(f"Candidate pairs found (coarse ≤ {coarse_candidate_km} km): **{len(candidate_pairs)}**")
@@ -383,10 +422,6 @@ def refine_pair(
     refine_step_min: int,
     window_hours: int,
 ) -> float:
-    """
-    Re-simulate A and B with finer steps around center_time.
-    Return min distance (km) in that refined window.
-    """
     satA = Satrec.twoline2rv(tle_a.line1, tle_a.line2)
     satB = Satrec.twoline2rv(tle_b.line1, tle_b.line2)
 
@@ -408,10 +443,9 @@ def refine_pair(
     return float(np.min(d))
 
 
-# Map name->TLEItem for refinement
 tle_by_name = {it.name: it for it in tle_items}
 
-refined_events: List[Tuple[str, str, float, float]] = []  # (A,B, refined_min_km, coarse_min_km)
+refined_events: List[Tuple[str, str, float, float]] = []
 
 with st.spinner("Refining candidate pairs (finer time steps)..."):
     for (i, j), (coarse_d, t_best) in cand_items:
@@ -434,7 +468,9 @@ with st.spinner("Refining candidate pairs (finer time steps)..."):
         if d_ref <= final_threshold_km:
             refined_events.append((A, B, d_ref, coarse_d))
 
-# Results table
+# -----------------------------
+# RESULTS
+# -----------------------------
 st.subheader("✅ High-Risk Conjunction Events")
 
 if refined_events:
@@ -462,8 +498,8 @@ st.subheader("🧊 3D Interactive Orbit Viewer (Plotly)")
 
 plot_names = names[:min(plot_tracks, len(names))]
 
-T_plot = min(min_T, plot_points_cap)
-idxs = np.linspace(0, min_T - 1, T_plot).astype(int)
+T_plot = min(T, plot_points_cap)
+idxs = np.linspace(0, T - 1, T_plot).astype(int)
 
 fig = go.Figure()
 
@@ -472,7 +508,7 @@ if refined_events:
     highlight_pair = {refined_events[0][0], refined_events[0][1]}
 
 for nm in plot_names:
-    track = sat_pos_coarse[nm][:min_T][idxs]
+    track = sat_pos_coarse[nm][:T][idxs]
     valid = np.isfinite(track).all(axis=1)
     track = track[valid]
     if len(track) < 2:
@@ -492,7 +528,7 @@ for nm in plot_names:
         )
     )
 
-# Add Earth sphere
+# Earth sphere
 u = np.linspace(0, 2 * np.pi, 50)
 v = np.linspace(0, np.pi, 25)
 xs = EARTH_RADIUS_KM * np.outer(np.cos(u), np.sin(v))
@@ -501,11 +537,13 @@ zs = EARTH_RADIUS_KM * np.outer(np.ones_like(u), np.cos(v))
 
 fig.add_trace(
     go.Surface(
-        x=xs, y=ys, z=zs,
+        x=xs,
+        y=ys,
+        z=zs,
         showscale=False,
         opacity=0.2,
         name="Earth",
-        hoverinfo="skip"
+        hoverinfo="skip",
     )
 )
 
@@ -522,7 +560,7 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------------
-# SUMMARY + EXTENSIONS (for your poster)
+# SUMMARY
 # -----------------------------
 st.subheader("📘 What you upgraded (for your project report)")
 
