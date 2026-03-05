@@ -1,11 +1,13 @@
 # orbital_debris_app.py
-# COMPLETE FIXED + SELF-HEALING VERSION (Streamlit Cloud friendly)
-# Adds:
-# - Hard validation for TLE lines (length + startswith)
-# - Debug table for parse + propagation failures
-# - Auto fallback to SAMPLE_TLE_TEXT if web/upload yields <2 valid propagated objects
-# - Keeps time alignment (no dropping invalid SGP4 points)
-# - Skips NaNs in binning and distance checks
+# COMPLETE FIXED VERSION (robust upload parsing + strong debugging + no bin_key crash)
+# Key fixes for your exact issue ("Too few valid propagated objects..."):
+# - Sanitizes lines (removes BOM/zero-width chars) so uploaded Celestrak files parse correctly
+# - Accepts "0 NAME" format used by Celestrak
+# - Looser TLE line detection (length >= 50, '1'/'2' + whitespace)
+# - Logs twoline2rv failures AND SGP4 error codes so you can see why objects fail
+# - Keeps time alignment across satellites (no dropping invalid points)
+# - Skips NaNs during binning and distance checks
+# - Only falls back to sample if uploaded/web truly produces <2 valid propagated objects
 
 from __future__ import annotations
 
@@ -53,7 +55,7 @@ st.title("🛰️ Optical Tracking of Orbital Debris (Software-Based)")
 st.caption("SGP4 orbit propagation + LEO/MEO/GEO filtering + 3D visualization + coarse→refined conjunction detection.")
 
 # -----------------------------
-# SIDEBAR
+# SIDEBAR CONTROLS
 # -----------------------------
 st.sidebar.header("📥 TLE Input")
 try_web = st.sidebar.toggle("Try downloading TLEs (may time out on Streamlit Cloud)", value=True)
@@ -71,7 +73,13 @@ refine_window_hours = st.sidebar.slider("Refine window (± hours around closest 
 st.sidebar.divider()
 st.sidebar.header("🔎 Detection Thresholds")
 final_threshold_km = st.sidebar.slider("High-risk threshold (km)", 0.1, 10.0, 1.0)
-coarse_candidate_km = st.sidebar.slider("Coarse candidate threshold (km)", 1.0, 200.0, 25.0)
+coarse_candidate_km = st.sidebar.slider(
+    "Coarse candidate threshold (km)",
+    1.0,
+    200.0,
+    25.0,
+    help="Pairs closer than this in coarse scan get refined."
+)
 
 st.sidebar.divider()
 st.sidebar.header("🧭 Orbit Class Filter")
@@ -88,14 +96,83 @@ st.sidebar.header("🧊 3D Plot")
 plot_tracks = st.sidebar.slider("How many object tracks to plot (3D)", 5, 80, 25)
 plot_points_cap = st.sidebar.slider("Max points per track (3D)", 30, 500, 150, step=10)
 
+
 # -----------------------------
-# TLE STRUCTURES + HELPERS
+# TLE PARSING + LOADING
 # -----------------------------
 @dataclass
 class TLEItem:
     name: str
     line1: str
     line2: str
+
+
+def sanitize_line(s: str) -> str:
+    # Remove common invisible troublemakers in uploads: BOM + zero-width space
+    s = s.replace("\ufeff", "").replace("\u200b", "")
+    s = s.strip("\r\n")
+    return s.strip()
+
+
+def clean_name(nm: str) -> str:
+    nm = sanitize_line(nm)
+    # Celestrak files often use "0 NAME"
+    if nm.startswith("0 "):
+        nm = nm[2:].strip()
+    return nm
+
+
+def _looks_like_tle_line1(s: str) -> bool:
+    s = sanitize_line(s)
+    return len(s) >= 50 and s[0] == "1" and s[1].isspace()
+
+
+def _looks_like_tle_line2(s: str) -> bool:
+    s = sanitize_line(s)
+    return len(s) >= 50 and s[0] == "2" and s[1].isspace()
+
+
+def parse_tle_text(text: str) -> List[TLEItem]:
+    """
+    Handles:
+    - 3-line (name + line1 + line2)
+    - 2-line (line1 + line2)
+    - Celestrak '0 NAME' line style
+    - BOM/zero-width chars
+    """
+    raw_lines = text.splitlines()
+    lines = [sanitize_line(ln) for ln in raw_lines if sanitize_line(ln)]
+
+    items: List[TLEItem] = []
+    i = 0
+    while i < len(lines):
+        # 3-line format
+        if i + 2 < len(lines) and _looks_like_tle_line1(lines[i + 1]) and _looks_like_tle_line2(lines[i + 2]):
+            items.append(
+                TLEItem(
+                    name=clean_name(lines[i]),
+                    line1=sanitize_line(lines[i + 1]),
+                    line2=sanitize_line(lines[i + 2]),
+                )
+            )
+            i += 3
+            continue
+
+        # 2-line format
+        if i + 1 < len(lines) and _looks_like_tle_line1(lines[i]) and _looks_like_tle_line2(lines[i + 1]):
+            items.append(
+                TLEItem(
+                    name=f"OBJECT_{len(items)+1}",
+                    line1=sanitize_line(lines[i]),
+                    line2=sanitize_line(lines[i + 1]),
+                )
+            )
+            i += 2
+            continue
+
+        i += 1
+
+    return items
 
 
 def http_get_text(url: str, timeout: int = 12) -> Tuple[Optional[str], Optional[str]]:
@@ -111,35 +188,6 @@ def http_get_text(url: str, timeout: int = 12) -> Tuple[Optional[str], Optional[
         return None, str(e)
 
 
-def _looks_like_tle_line1(s: str) -> bool:
-    s = s.strip()
-    return s.startswith("1 ") and len(s) >= 60
-
-
-def _looks_like_tle_line2(s: str) -> bool:
-    s = s.strip()
-    return s.startswith("2 ") and len(s) >= 60
-
-
-def parse_tle_text(text: str) -> List[TLEItem]:
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    items: List[TLEItem] = []
-    i = 0
-    while i < len(lines):
-        # 3-line: name + 2 lines
-        if i + 2 < len(lines) and _looks_like_tle_line1(lines[i + 1]) and _looks_like_tle_line2(lines[i + 2]):
-            items.append(TLEItem(name=lines[i], line1=lines[i + 1], line2=lines[i + 2]))
-            i += 3
-            continue
-        # 2-line: no name
-        if i + 1 < len(lines) and _looks_like_tle_line1(lines[i]) and _looks_like_tle_line2(lines[i + 1]):
-            items.append(TLEItem(name=f"OBJECT_{len(items)+1}", line1=lines[i], line2=lines[i + 1]))
-            i += 2
-            continue
-        i += 1
-    return items
-
-
 @st.cache_data(show_spinner=False)
 def load_tles_from_web() -> Tuple[List[TLEItem], str, List[str]]:
     notes: List[str] = []
@@ -152,23 +200,32 @@ def load_tles_from_web() -> Tuple[List[TLEItem], str, List[str]]:
             notes.append(f"Parsed only {len(items)} TLEs from {url} (maybe HTML/blocked).")
         else:
             notes.append(f"Download failed {url}: {err}")
-    # fallback
+
     items = parse_tle_text(SAMPLE_TLE_TEXT)
     notes.append("Using built-in sample TLEs (web download failed or returned junk).")
     return items, "Built-in sample", notes
 
 
+# -----------------------------
+# ORBIT PROPAGATION HELPERS
+# -----------------------------
 def propagate_times(start: datetime, steps: int, step_minutes: int) -> List[datetime]:
     return [start + timedelta(minutes=k * step_minutes) for k in range(steps)]
 
 
-def sgp4_positions(sat: Satrec, times: List[datetime]) -> np.ndarray:
+def sgp4_positions_with_errors(sat: Satrec, times: List[datetime]) -> Tuple[np.ndarray, List[int]]:
+    """
+    Returns (positions, error_codes_per_step).
+    Positions shape: (len(times), 3). Invalid steps are NaN.
+    """
     out = np.empty((len(times), 3), dtype=np.float64)
+    errs: List[int] = []
     for i, t in enumerate(times):
         jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
         e, r, _v = sat.sgp4(jd, fr)
+        errs.append(int(e))
         out[i] = r if e == 0 else (np.nan, np.nan, np.nan)
-    return out
+    return out, errs
 
 
 def classify_orbit_by_alt_km(alt_km: float) -> str:
@@ -181,14 +238,75 @@ def classify_orbit_by_alt_km(alt_km: float) -> str:
     return "HighEarth/Other"
 
 
-def try_build_satrec(item: TLEItem) -> Tuple[Optional[Satrec], Optional[str]]:
-    try:
-        sat = Satrec.twoline2rv(item.line1, item.line2)
-        return sat, None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+def propagate_all(tle_items: List[TLEItem], coarse_times: List[datetime]) -> Tuple[
+    Dict[str, np.ndarray], Dict[str, str], Dict[str, float], pd.DataFrame
+]:
+    """
+    Returns:
+    - sat_pos_coarse[name] -> (T,3) aligned
+    - sat_class[name] -> class
+    - sat_alt0[name] -> altitude from first valid step
+    - debug_df rows for failures/success
+    """
+    sat_pos_coarse: Dict[str, np.ndarray] = {}
+    sat_class: Dict[str, str] = {}
+    sat_alt0: Dict[str, float] = {}
+
+    debug_rows: List[dict] = []
+
+    for item in tle_items:
+        row = {
+            "name": item.name,
+            "twoline2rv_ok": False,
+            "twoline2rv_error": "",
+            "valid_steps": 0,
+            "first_valid_step": None,
+            "sample_sgp4_error_codes": "",
+            "classified": "",
+            "alt0_km": None,
+        }
+
+        try:
+            sat = Satrec.twoline2rv(item.line1, item.line2)
+            row["twoline2rv_ok"] = True
+        except Exception as e:
+            row["twoline2rv_error"] = f"{type(e).__name__}: {e}"
+            debug_rows.append(row)
+            continue
+
+        pos, errs = sgp4_positions_with_errors(sat, coarse_times)
+        finite_mask = np.isfinite(pos).all(axis=1)
+        valid_count = int(np.sum(finite_mask))
+        row["valid_steps"] = valid_count
+
+        if valid_count == 0:
+            nonzero = [e for e in errs if e != 0]
+            row["sample_sgp4_error_codes"] = str(nonzero[:8])
+            debug_rows.append(row)
+            continue
+
+        first_idx = int(np.argmax(finite_mask))
+        row["first_valid_step"] = first_idx
+
+        r0 = float(np.linalg.norm(pos[first_idx]))
+        alt0 = r0 - EARTH_RADIUS_KM
+        cls = classify_orbit_by_alt_km(alt0)
+        row["classified"] = cls
+        row["alt0_km"] = float(alt0)
+
+        sat_pos_coarse[item.name] = pos
+        sat_class[item.name] = cls
+        sat_alt0[item.name] = float(alt0)
+
+        debug_rows.append(row)
+
+    debug_df = pd.DataFrame(debug_rows)
+    return sat_pos_coarse, sat_class, sat_alt0, debug_df
 
 
+# -----------------------------
+# COARSE BINNING HELPERS
+# -----------------------------
 def bin_key(vec: np.ndarray, bin_km: int) -> Optional[Tuple[int, int, int]]:
     if vec is None:
         return None
@@ -204,61 +322,22 @@ def neighbor_bins(k: Tuple[int, int, int]) -> List[Tuple[int, int, int]]:
     return [(x + dx, y + dy, z + dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)]
 
 
-def load_initial_tles() -> Tuple[List[TLEItem], str, List[str]]:
-    if uploaded_tle is not None:
-        raw = uploaded_tle.read().decode("utf-8", errors="ignore")
-        items = parse_tle_text(raw)
-        return items, "Uploaded TLE file", ["Using uploaded file."]
+# -----------------------------
+# LOAD TLEs
+# -----------------------------
+if uploaded_tle is not None:
+    raw = uploaded_tle.read().decode("utf-8", errors="ignore")
+    tle_items = parse_tle_text(raw)
+    tle_source = "Uploaded TLE file"
+    tle_notes = ["Using uploaded file."]
+else:
     if try_web:
-        return load_tles_from_web()
-    items = parse_tle_text(SAMPLE_TLE_TEXT)
-    return items, "Built-in sample", ["Web download disabled; using built-in sample."]
+        tle_items, tle_source, tle_notes = load_tles_from_web()
+    else:
+        tle_items = parse_tle_text(SAMPLE_TLE_TEXT)
+        tle_source = "Built-in sample"
+        tle_notes = ["Web download disabled; using built-in sample."]
 
-
-def propagate_all(tle_items: List[TLEItem], coarse_times: List[datetime]) -> Tuple[
-    Dict[str, np.ndarray], Dict[str, str], Dict[str, float], List[str]
-]:
-    sat_pos_coarse: Dict[str, np.ndarray] = {}
-    sat_class: Dict[str, str] = {}
-    sat_alt0: Dict[str, float] = {}
-    fail_log: List[str] = []
-
-    for item in tle_items:
-        sat, err = try_build_satrec(item)
-        if sat is None:
-            fail_log.append(f"{item.name}: twoline2rv failed -> {err}")
-            continue
-
-        pos = sgp4_positions(sat, coarse_times)
-        finite_mask = np.isfinite(pos).all(axis=1)
-        if not np.any(finite_mask):
-            fail_log.append(f"{item.name}: SGP4 produced NaN at all time steps (likely bad/old TLE)")
-            continue
-
-        first_idx = int(np.argmax(finite_mask))
-        r0 = float(np.linalg.norm(pos[first_idx]))
-        alt0 = r0 - EARTH_RADIUS_KM
-        cls = classify_orbit_by_alt_km(alt0)
-
-        sat_pos_coarse[item.name] = pos
-        sat_class[item.name] = cls
-        sat_alt0[item.name] = alt0
-
-    return sat_pos_coarse, sat_class, sat_alt0, fail_log
-
-
-# -----------------------------
-# TIME GRID
-# -----------------------------
-coarse_step_minutes = int(24 * 60 / coarse_steps_per_day)
-coarse_steps = int(days_to_simulate * coarse_steps_per_day)
-t0 = datetime.utcnow()
-coarse_times = propagate_times(t0, coarse_steps, coarse_step_minutes)
-
-# -----------------------------
-# LOAD + PARSE TLEs
-# -----------------------------
-tle_items, tle_source, tle_notes = load_initial_tles()
 tle_items = tle_items[:num_objects]
 
 st.success(f"TLE source: **{tle_source}** • Parsed: **{len(tle_items)} objects**")
@@ -274,58 +353,65 @@ with st.expander("Debug: preview parsed TLEs (first 10)"):
         st.code(it.line2)
 
 if len(tle_items) < 2:
-    st.error("Need at least 2 TLE objects to run.")
+    st.error("Need at least 2 TLE objects to run conjunction detection.")
     st.stop()
 
 # -----------------------------
-# PROPAGATE (with auto fallback)
+# TIME GRID
+# -----------------------------
+coarse_step_minutes = int(24 * 60 / coarse_steps_per_day)
+coarse_steps = int(days_to_simulate * coarse_steps_per_day)
+t0 = datetime.utcnow()
+coarse_times = propagate_times(t0, coarse_steps, coarse_step_minutes)
+
+# -----------------------------
+# PROPAGATION (with fallback)
 # -----------------------------
 st.subheader("🧮 Propagation + Orbit Class Filtering")
 
 with st.spinner("Propagating coarse trajectories (SGP4)..."):
-    sat_pos_coarse, sat_class, sat_alt0, fail_log = propagate_all(tle_items, coarse_times)
+    sat_pos_coarse, sat_class, sat_alt0, debug_df = propagate_all(tle_items, coarse_times)
 
-# If <2 valid, auto fallback to SAMPLE (keeps demo running)
-if len(sat_pos_coarse) < 2 and tle_source != "Built-in sample":
+valid_names = list(sat_pos_coarse.keys())
+
+st.write(f"Valid propagated: **{len(valid_names)}** • Skipped: **{len(tle_items) - len(valid_names)}**")
+
+with st.expander("Debug: propagation diagnostics (first 200 rows)"):
+    st.dataframe(debug_df.head(200), use_container_width=True)
+
+# If uploaded/web source fails, fallback to built-in sample
+if len(valid_names) < 2 and tle_source != "Built-in sample":
     st.warning("Too few valid propagated objects from your source. Falling back to built-in sample TLEs so the demo runs.")
     tle_items = parse_tle_text(SAMPLE_TLE_TEXT)
     tle_source = "Built-in sample (auto fallback)"
-    sat_pos_coarse, sat_class, sat_alt0, fail_log = propagate_all(tle_items, coarse_times)
+    sat_pos_coarse, sat_class, sat_alt0, debug_df = propagate_all(tle_items, coarse_times)
+    valid_names = list(sat_pos_coarse.keys())
+    st.write(f"After fallback, valid propagated: **{len(valid_names)}**")
 
-names_all = list(sat_pos_coarse.keys())
-
-st.write(f"Valid propagated: **{len(names_all)}** • Skipped: **{max(0, len(tle_items) - len(names_all))}**")
-
-if fail_log:
-    with st.expander("Debug: why objects were skipped (first 50)"):
-        for msg in fail_log[:50]:
-            st.write("•", msg)
-
-if len(names_all) < 2:
+if len(valid_names) < 2:
     st.error(
         "Propagation produced fewer than 2 valid objects even after fallback. "
-        "This means your environment is failing SGP4 or your input is not real TLEs."
+        "This suggests a runtime/environment issue or SGP4 failing globally."
     )
     st.stop()
 
 # Apply orbit filter
 if orbit_class == "All":
-    names = names_all
+    names = valid_names
 else:
-    names = [n for n in names_all if sat_class.get(n) == orbit_class]
+    names = [n for n in valid_names if sat_class.get(n) == orbit_class]
 
 st.write(f"After filter ({orbit_class}): **{len(names)}**")
-
 if len(names) < 2:
     st.warning("Not enough objects after orbit-class filtering. Choose 'All' or upload a larger TLE set.")
     st.stop()
 
-counts = pd.Series([sat_class[n] for n in names_all]).value_counts()
+counts = pd.Series([sat_class[n] for n in valid_names]).value_counts()
 with st.expander("Orbit class counts (based on first valid-step altitude)"):
     st.dataframe(counts.rename("count").to_frame(), use_container_width=True)
 
 # -----------------------------
-# COARSE DETECTION
+# COARSE CONJUNCTION DETECTION
 # -----------------------------
 st.subheader("🔍 Coarse→Refined Conjunction Detection")
 st.caption(
@@ -358,6 +444,7 @@ with st.spinner("Running coarse scan (grid-binning)..."):
 
             if len(neighbor_idxs) < 2:
                 continue
+
             neighbor_idxs = sorted(set(neighbor_idxs))
 
             for a_pos in range(len(neighbor_idxs)):
@@ -396,6 +483,15 @@ st.write(f"Candidate pairs refined (cap {max_total_candidates}): **{len(cand_ite
 # -----------------------------
 # REFINED CHECK
 # -----------------------------
+def sgp4_positions(sat: Satrec, times: List[datetime]) -> np.ndarray:
+    out = np.empty((len(times), 3), dtype=np.float64)
+    for i, t in enumerate(times):
+        jd, fr = jday(t.year, t.month, t.day, t.hour, t.minute, t.second)
+        e, r, _v = sat.sgp4(jd, fr)
+        out[i] = r if e == 0 else (np.nan, np.nan, np.nan)
+    return out
+
+
 def refine_pair(
     tle_a: TLEItem,
     tle_b: TLEItem,
@@ -505,7 +601,6 @@ for nm in plot_names:
         )
     )
 
-# Earth sphere
 u = np.linspace(0, 2 * np.pi, 50)
 v = np.linspace(0, np.pi, 25)
 xs = EARTH_RADIUS_KM * np.outer(np.cos(u), np.sin(v))
